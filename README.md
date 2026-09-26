@@ -1,25 +1,18 @@
-# 🎈 Blank app template
+# Axle Grinding Process Monitor
 
-A simple Streamlit app template for you to modify!
+Upload an Excel workbook to review left and right axle measurements with three-sigma control charts. The app reports each measurement's mean and sample standard deviation, highlights points beyond the control limits, and flags sustained monotonic trends.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Workbook format
 
-### How to run it on your own machine
+Include these column headers in the worksheet: `serial number`, `left`, and `right`. Headers are case-insensitive. Rows without a serial number or numeric left/right values are omitted from the analysis. If the workbook has multiple sheets, select the worksheet to analyze in the app.
 
-Prerequisite: install `uv` if you don't already have it.
+The control limits are calculated independently for left and right as mean ± 3 times the sample standard deviation. A sequence of seven consecutive increases or decreases is flagged as a possible trend. Any point beyond a control limit triggers a recommendation to stop the machine and hand the process over to maintenance; a trend without an outlier prompts a process check and closer monitoring.
+
+## Run locally
+
+Install `uv` if it is not already available, then run:
 
 ```
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
+uv run streamlit run streamlit_app.py
 ```
-
-1. Sync the dependencies
-
-   ```
-   $ uv sync
-   ```
-
-2. Run the app
-
-   ```
-   $ uv run streamlit run streamlit_app.py
-   ```
