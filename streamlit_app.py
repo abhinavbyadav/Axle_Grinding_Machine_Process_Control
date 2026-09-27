@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -37,6 +40,8 @@ st.markdown(
     .status-box.alert { border-left-color: var(--orange); background: #f8ece5; }
     .status-title { font-weight: 700; margin-bottom: 3px; }
     .status-copy { color: #43514d; }
+    .date-time { color: var(--muted); font: 500 0.82rem 'DM Mono', monospace;
+        text-align: right; padding-top: 0.65rem; line-height: 1.5; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -162,7 +167,15 @@ def make_chart(
 
 
 #st.markdown('<div class="eyebrow"> \n\n Axle grinding / process control</div>', unsafe_allow_html=True)
-st.title("Grinding Machine Performance Monitor")
+title_col, date_col = st.columns([5, 1])
+with title_col:
+    st.title("Grinding Machine Performance Monitor")
+with date_col:
+    current_time = datetime.now(ZoneInfo("Asia/Kolkata"))
+    st.markdown(
+        f'<div class="date-time">{current_time:%d %b %Y}<br>{current_time:%H:%M:%S}</div>',
+        unsafe_allow_html=True,
+    )
 st.write("Utility to review the axle journal dia measurements on Control Chart")
 
 with st.sidebar:
