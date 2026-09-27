@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from math import ceil, floor
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -68,6 +69,9 @@ def make_chart(
     stddev: float,
     outlier_positions: set[int],
     trend_positions: set[int],
+    axis_min: float,
+    axis_max: float,
+    axis_dtick: float,
 ) -> go.Figure:
     values = frame[measurement]
     x_values = frame["_serial_label"]
@@ -160,6 +164,8 @@ def make_chart(
             "zeroline": True,
             "zerolinecolor": "#000000",
             "zerolinewidth": 1,
+            "range": [axis_min, axis_max],
+            "dtick": axis_dtick,
         },
         hovermode="closest",
     )
@@ -244,6 +250,23 @@ for measurement, summary in statistics.items():
 
 outlier_count = sum(len(result["outliers"]) for result in analysis.values())
 trend_sides = [name for name, result in analysis.items() if result["trends"]]
+axis_values = pd.concat(
+    [
+        data["left"],
+        data["right"],
+        pd.Series([result["lower_limit"] for result in analysis.values()]),
+        pd.Series([result["upper_limit"] for result in analysis.values()]),
+    ]
+)
+axis_min_value = float(axis_values.min())
+axis_max_value = float(axis_values.max())
+axis_span = axis_max_value - axis_min_value
+axis_padding = axis_span * 0.05 if axis_span else max(abs(axis_max_value) * 0.05, 0.5)
+axis_min = axis_min_value - axis_padding
+axis_max = axis_max_value + axis_padding
+axis_dtick = (axis_max - axis_min) / 6
+axis_min = floor(axis_min / axis_dtick) * axis_dtick
+axis_max = ceil(axis_max / axis_dtick) * axis_dtick
 left_col, right_col, sample_col = st.columns(3)
 left_col.metric("Left mean", f"{statistics['left']['mean']:.3f}")
 right_col.metric("Right mean", f"{statistics['right']['mean']:.3f}")
@@ -278,7 +301,17 @@ for column, measurement in ((left_chart, "left"), (right_chart, "right")):
         stat_col.metric("Mean", f"{result['mean']:.3f}")
         dev_col.metric("Std. deviation (sample)", f"{result['stddev']:.3f}")
         st.plotly_chart(
-            make_chart(data, measurement, result["mean"], result["stddev"], result["outliers"], result["trends"]),
+            make_chart(
+                data,
+                measurement,
+                result["mean"],
+                result["stddev"],
+                result["outliers"],
+                result["trends"],
+                axis_min,
+                axis_max,
+                axis_dtick,
+            ),
             width="stretch",
         )
         if result["outliers"]:
