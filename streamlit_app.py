@@ -50,6 +50,13 @@ st.markdown(
     .status-copy { color: #43514d; }
     .date-time { color: var(--muted); font: 500 0.82rem 'DM Mono', monospace;
         text-align: right; padding-top: 0.65rem; line-height: 1.5; }
+    [data-testid="stDownloadButton"] button {
+        background: var(--green) !important;
+        border: 1px solid var(--green) !important;
+        color: #ffffff !important;
+    }
+    [data-testid="stDownloadButton"] button * { color: #ffffff !important; }
+    [data-testid="stDownloadButton"] button:hover { background: #0f5943 !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -187,12 +194,17 @@ class PdfControlChart(Flowable):
         self.result = result
         self.axis_min = axis_min
         self.axis_max = axis_max
-        self.height = 2.8 * inch
+        self.height = 2.45 * inch
+
+    def wrap(self, avail_width: float, avail_height: float) -> tuple[float, float]:
+        self.width = avail_width
+        return self.width, self.height
 
     def draw(self) -> None:
         canvas = self.canv
-        plot_left, plot_bottom = 42, 32
-        plot_width, plot_height = self.width - 142, self.height - 54
+        plot_left, plot_bottom = 32, 29
+        plot_width = self.width - plot_left - 8
+        plot_height = self.height - 42 - plot_bottom
         canvas.saveState()
         canvas.setFillColor(colors.white)
         canvas.rect(plot_left, plot_bottom, plot_width, plot_height, fill=1, stroke=0)
@@ -221,10 +233,6 @@ class PdfControlChart(Flowable):
             canvas.setLineWidth(1)
             canvas.line(plot_left, y, plot_left + plot_width, y)
             canvas.setDash()
-            canvas.setFillColor(colors.HexColor(color))
-            canvas.setFont("Helvetica", 7)
-            label = {"lower_limit": "Lower limit", "mean": "Mean", "upper_limit": "Upper limit"}[key]
-            canvas.drawString(plot_left + plot_width + 5, y - 2, f"{label}: {float(self.result[key]):.3f}")
 
         values = self.frame[self.measurement].tolist()
         positions = [
@@ -236,22 +244,35 @@ class PdfControlChart(Flowable):
         for start, end in zip(positions, positions[1:]):
             canvas.line(start[0], start[1], end[0], end[1])
 
-        legend_y = self.height - 10
+        marker_legend_y = self.height - 10
         for legend_x, label, color, marker in (
             (plot_left, "In control", "#146b52", "circle"),
             (plot_left + 78, "Trend", "#d58a20", "circle"),
-            (plot_left + 126, "Beyond 3 sigma", "#b84f24", "cross"),
+            (plot_left + 128, "Beyond 3 sigma", "#b84f24", "cross"),
         ):
             canvas.setStrokeColor(colors.HexColor(color))
             canvas.setFillColor(colors.HexColor(color))
             if marker == "cross":
-                canvas.line(legend_x - 3, legend_y - 3, legend_x + 3, legend_y + 3)
-                canvas.line(legend_x - 3, legend_y + 3, legend_x + 3, legend_y - 3)
+                canvas.line(legend_x - 3, marker_legend_y - 3, legend_x + 3, marker_legend_y + 3)
+                canvas.line(legend_x - 3, marker_legend_y + 3, legend_x + 3, marker_legend_y - 3)
             else:
-                canvas.circle(legend_x, legend_y, 2.5, fill=1, stroke=0)
+                canvas.circle(legend_x, marker_legend_y, 2.5, fill=1, stroke=0)
             canvas.setFillColor(colors.HexColor("#43514d"))
             canvas.setFont("Helvetica", 7)
-            canvas.drawString(legend_x + 6, legend_y - 2, label)
+            canvas.drawString(legend_x + 6, marker_legend_y - 2, label)
+
+        line_legend_y = self.height - 23
+        for legend_x, label, color, dash in (
+            (plot_left, "Mean", "#146b52", []),
+            (plot_left + 70, "3 sigma limits", "#b84f24", [3, 2]),
+        ):
+            canvas.setStrokeColor(colors.HexColor(color))
+            canvas.setDash(dash)
+            canvas.line(legend_x, line_legend_y, legend_x + 10, line_legend_y)
+            canvas.setDash()
+            canvas.setFillColor(colors.HexColor("#43514d"))
+            canvas.setFont("Helvetica", 7)
+            canvas.drawString(legend_x + 14, line_legend_y - 2, label)
 
         outliers = self.result["outliers"]
         trends = self.result["trends"]
@@ -267,7 +288,7 @@ class PdfControlChart(Flowable):
         canvas.setFillColor(colors.HexColor("#43514d"))
         canvas.setFont("Helvetica", 7)
         serials = self.frame["_serial_label"].tolist()
-        for index in sorted({0, len(serials) // 2, len(serials) - 1}):
+        for index in sorted({0, len(serials) - 1}):
             x = positions[index][0]
             label = str(serials[index])[:24]
             if index == 0:
@@ -320,8 +341,13 @@ def build_pdf_report(
 
     summary_table = Table(
         [
-            ["Left mean", "Right mean", "Valid measurements"],
+            ["Left measurement", "Right measurement", "Valid measurements"],
             [f"{statistics['left']['mean']:.3f}", f"{statistics['right']['mean']:.3f}", f"{len(frame):,}"],
+            [
+                f"Sample std. dev.: {statistics['left']['stddev']:.3f}",
+                f"Sample std. dev.: {statistics['right']['stddev']:.3f}",
+                "",
+            ],
         ],
         colWidths=[2.4 * inch] * 3,
     )
@@ -366,18 +392,20 @@ def build_pdf_report(
     ]))
     story.extend([Spacer(1, 9), recommendation_table])
 
+    chart_headings = []
+    chart_summaries = []
+    charts = []
+    findings = []
     for measurement in ("left", "right"):
         result = analysis[measurement]
-        story.extend([
-            Paragraph(f"{measurement.title()} measurement", styles["Section"]),
-            Paragraph(
-                f"Mean: {float(result['mean']):.3f} &nbsp; | &nbsp; "
-                f"Sample standard deviation: {float(result['stddev']):.3f} &nbsp; | &nbsp; "
-                f"Control limits: {float(result['lower_limit']):.3f} to {float(result['upper_limit']):.3f}",
-                styles["Small"],
-            ),
-            PdfControlChart(frame, measurement, result, axis_min, axis_max),
-        ])
+        chart_headings.append(Paragraph(f"{measurement.title()} measurement", styles["Heading3"]))
+        chart_summaries.append(Paragraph(
+            f"Mean: {float(result['mean']):.3f} &nbsp; | &nbsp; "
+            f"Sample std. dev.: {float(result['stddev']):.3f}<br/>"
+            f"3 sigma limits: {float(result['lower_limit']):.3f} to {float(result['upper_limit']):.3f}",
+            styles["Small"],
+        ))
+        charts.append(PdfControlChart(frame, measurement, result, axis_min, axis_max))
         if result["outliers"]:
             labels = ", ".join(str(value) for value in frame.loc[sorted(result["outliers"]), "_serial_label"])
             finding = f"Beyond 3 sigma: serial number(s) {labels}. Stop machine and hand over for maintenance."
@@ -385,7 +413,21 @@ def build_pdf_report(
             finding = "A run of 7 consecutive increases or decreases was detected. Check for process drift and monitor closely."
         else:
             finding = "No outliers or sustained trend detected for this measurement."
-        story.append(Paragraph(escape(finding), styles["Small"]))
+        findings.append(Paragraph(escape(finding), styles["Small"]))
+
+    chart_table = Table(
+        [chart_headings, chart_summaries, charts, findings],
+        colWidths=[3.6 * inch, 3.6 * inch],
+    )
+    chart_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBEFORE", (1, 0), (1, -1), 0.5, colors.HexColor("#dce3dc")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.extend([Paragraph("Control charts", styles["Section"]), chart_table])
 
     story.extend([Paragraph("Validated measurements", styles["Section"])])
     table_data = [["Serial number", "Left", "Right"]]
@@ -590,4 +632,5 @@ pdf_download_slot.download_button(
     file_name=f"axle_process_report_{current_time:%Y%m%d}.pdf",
     mime="application/pdf",
     width="stretch",
+    type="primary",
 )
