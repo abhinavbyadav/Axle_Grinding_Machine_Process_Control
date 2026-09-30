@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from io import BytesIO
 from datetime import datetime
 from math import ceil, floor
+from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import Flowable, LongTable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 st.set_page_config(page_title="Axle Process Monitor", page_icon="⚙️", layout="wide")
@@ -172,10 +179,250 @@ def make_chart(
     return figure
 
 
+class PdfControlChart(Flowable):
+    def __init__(self, frame: pd.DataFrame, measurement: str, result: dict[str, object], axis_min: float, axis_max: float):
+        super().__init__()
+        self.frame = frame
+        self.measurement = measurement
+        self.result = result
+        self.axis_min = axis_min
+        self.axis_max = axis_max
+        self.height = 2.8 * inch
+
+    def draw(self) -> None:
+        canvas = self.canv
+        plot_left, plot_bottom = 42, 32
+        plot_width, plot_height = self.width - 142, self.height - 54
+        canvas.saveState()
+        canvas.setFillColor(colors.white)
+        canvas.rect(plot_left, plot_bottom, plot_width, plot_height, fill=1, stroke=0)
+
+        for tick in range(5):
+            value = self.axis_min + (self.axis_max - self.axis_min) * tick / 4
+            y = plot_bottom + plot_height * tick / 4
+            canvas.setStrokeColor(colors.HexColor("#dce3dc"))
+            canvas.setLineWidth(0.5)
+            canvas.line(plot_left, y, plot_left + plot_width, y)
+            canvas.setFillColor(colors.HexColor("#43514d"))
+            canvas.setFont("Helvetica", 7)
+            canvas.drawRightString(plot_left - 5, y - 2, f"{value:.3f}")
+
+        def y_position(value: float) -> float:
+            return plot_bottom + (value - self.axis_min) / (self.axis_max - self.axis_min) * plot_height
+
+        for key, color, dash in (
+            ("lower_limit", "#b84f24", [3, 2]),
+            ("mean", "#146b52", []),
+            ("upper_limit", "#b84f24", [3, 2]),
+        ):
+            y = y_position(float(self.result[key]))
+            canvas.setStrokeColor(colors.HexColor(color))
+            canvas.setDash(dash)
+            canvas.setLineWidth(1)
+            canvas.line(plot_left, y, plot_left + plot_width, y)
+            canvas.setDash()
+            canvas.setFillColor(colors.HexColor(color))
+            canvas.setFont("Helvetica", 7)
+            label = {"lower_limit": "Lower limit", "mean": "Mean", "upper_limit": "Upper limit"}[key]
+            canvas.drawString(plot_left + plot_width + 5, y - 2, f"{label}: {float(self.result[key]):.3f}")
+
+        values = self.frame[self.measurement].tolist()
+        positions = [
+            (plot_left + plot_width * index / max(len(values) - 1, 1), y_position(value))
+            for index, value in enumerate(values)
+        ]
+        canvas.setStrokeColor(colors.HexColor("#aab9b2"))
+        canvas.setLineWidth(0.8)
+        for start, end in zip(positions, positions[1:]):
+            canvas.line(start[0], start[1], end[0], end[1])
+
+        legend_y = self.height - 10
+        for legend_x, label, color, marker in (
+            (plot_left, "In control", "#146b52", "circle"),
+            (plot_left + 78, "Trend", "#d58a20", "circle"),
+            (plot_left + 126, "Beyond 3 sigma", "#b84f24", "cross"),
+        ):
+            canvas.setStrokeColor(colors.HexColor(color))
+            canvas.setFillColor(colors.HexColor(color))
+            if marker == "cross":
+                canvas.line(legend_x - 3, legend_y - 3, legend_x + 3, legend_y + 3)
+                canvas.line(legend_x - 3, legend_y + 3, legend_x + 3, legend_y - 3)
+            else:
+                canvas.circle(legend_x, legend_y, 2.5, fill=1, stroke=0)
+            canvas.setFillColor(colors.HexColor("#43514d"))
+            canvas.setFont("Helvetica", 7)
+            canvas.drawString(legend_x + 6, legend_y - 2, label)
+
+        outliers = self.result["outliers"]
+        trends = self.result["trends"]
+        for index, (x, y) in enumerate(positions):
+            if index in outliers:
+                canvas.setStrokeColor(colors.HexColor("#b84f24"))
+                canvas.line(x - 3, y - 3, x + 3, y + 3)
+                canvas.line(x - 3, y + 3, x + 3, y - 3)
+            else:
+                canvas.setFillColor(colors.HexColor("#d58a20" if index in trends else "#146b52"))
+                canvas.circle(x, y, 2.5, fill=1, stroke=0)
+
+        canvas.setFillColor(colors.HexColor("#43514d"))
+        canvas.setFont("Helvetica", 7)
+        serials = self.frame["_serial_label"].tolist()
+        for index in sorted({0, len(serials) // 2, len(serials) - 1}):
+            x = positions[index][0]
+            label = str(serials[index])[:24]
+            if index == 0:
+                canvas.drawString(x, plot_bottom - 12, label)
+            elif index == len(serials) - 1:
+                canvas.drawRightString(x, plot_bottom - 12, label)
+            else:
+                canvas.drawCentredString(x, plot_bottom - 12, label)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawCentredString(plot_left + plot_width / 2, 4, "Serial number (upload order)")
+        canvas.restoreState()
+
+
+def build_pdf_report(
+    frame: pd.DataFrame,
+    analysis: dict[str, dict[str, object]],
+    statistics: dict[str, dict[str, float]],
+    outlier_count: int,
+    trend_sides: list[str],
+    axis_min: float,
+    axis_max: float,
+    source_name: str,
+    sheet_name: str,
+    generated_at: datetime,
+) -> bytes:
+    buffer = BytesIO()
+    document = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=0.55 * inch,
+        leftMargin=0.55 * inch,
+        topMargin=0.55 * inch,
+        bottomMargin=0.6 * inch,
+        title="Axle Grinding Process Report",
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], textColor=colors.HexColor("#162522"), alignment=0))
+    styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], textColor=colors.HexColor("#146b52"), spaceBefore=10, spaceAfter=5))
+    styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=8, leading=10))
+    story: list[Flowable] = [
+        Paragraph("Grinding Machine Performance Monitor", styles["ReportTitle"]),
+        Paragraph(
+            f"Generated {generated_at:%d %b %Y, %H:%M:%S} IST &nbsp; | &nbsp; "
+            f"Workbook: {escape(source_name)} &nbsp; | &nbsp; Worksheet: {escape(sheet_name)}",
+            styles["Small"],
+        ),
+        Spacer(1, 10),
+        Paragraph("Process summary", styles["Section"]),
+    ]
+
+    summary_table = Table(
+        [
+            ["Left mean", "Right mean", "Valid measurements"],
+            [f"{statistics['left']['mean']:.3f}", f"{statistics['right']['mean']:.3f}", f"{len(frame):,}"],
+        ],
+        colWidths=[2.4 * inch] * 3,
+    )
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8f1ec")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#43514d")),
+        ("TEXTCOLOR", (0, 1), (-1, 1), colors.HexColor("#162522")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#dce3dc")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dce3dc")),
+    ]))
+    story.append(summary_table)
+
+    if outlier_count:
+        recommendation = (
+            f"<b>STOP MACHINE: {outlier_count} point(s) beyond 3 sigma.</b> "
+            "Stop the machine and hand over to maintenance for inspection before resuming production."
+        )
+    elif trend_sides:
+        sides = " and ".join(side.title() for side in trend_sides)
+        recommendation = (
+            f"<b>Possible process trend: {escape(sides)}.</b> "
+            "Check setup, tooling, and measurement conditions; inform the process owner and monitor the next measurements closely."
+        )
+    else:
+        recommendation = (
+            "<b>No 3 sigma outliers or sustained trend detected.</b> "
+            "Continue normal operation and routine monitoring."
+        )
+    recommendation_table = Table([[Paragraph(recommendation, styles["BodyText"])]], colWidths=[7.2 * inch])
+    recommendation_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8ece5" if outlier_count or trend_sides else "#e8f1ec")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#b84f24" if outlier_count or trend_sides else "#146b52")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.extend([Spacer(1, 9), recommendation_table])
+
+    for measurement in ("left", "right"):
+        result = analysis[measurement]
+        story.extend([
+            Paragraph(f"{measurement.title()} measurement", styles["Section"]),
+            Paragraph(
+                f"Mean: {float(result['mean']):.3f} &nbsp; | &nbsp; "
+                f"Sample standard deviation: {float(result['stddev']):.3f} &nbsp; | &nbsp; "
+                f"Control limits: {float(result['lower_limit']):.3f} to {float(result['upper_limit']):.3f}",
+                styles["Small"],
+            ),
+            PdfControlChart(frame, measurement, result, axis_min, axis_max),
+        ])
+        if result["outliers"]:
+            labels = ", ".join(str(value) for value in frame.loc[sorted(result["outliers"]), "_serial_label"])
+            finding = f"Beyond 3 sigma: serial number(s) {labels}. Stop machine and hand over for maintenance."
+        elif result["trends"]:
+            finding = "A run of 7 consecutive increases or decreases was detected. Check for process drift and monitor closely."
+        else:
+            finding = "No outliers or sustained trend detected for this measurement."
+        story.append(Paragraph(escape(finding), styles["Small"]))
+
+    story.extend([Paragraph("Validated measurements", styles["Section"])])
+    table_data = [["Serial number", "Left", "Right"]]
+    table_data.extend([
+        [str(row["serial number"]), f"{row['left']:.3f}", f"{row['right']:.3f}"]
+        for _, row in frame.iterrows()
+    ])
+    measurement_table = LongTable(table_data, colWidths=[3.6 * inch, 1.8 * inch, 1.8 * inch], repeatRows=1)
+    measurement_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#162522")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f4f6f2")]),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#dce3dc")),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(measurement_table)
+
+    def add_page_number(canvas, doc) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#65736f"))
+        canvas.drawRightString(letter[0] - 0.55 * inch, 0.32 * inch, f"Page {doc.page}")
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+    return buffer.getvalue()
+
+
 #st.markdown('<div class="eyebrow"> \n\n Axle grinding / process control</div>', unsafe_allow_html=True)
-title_col, date_col = st.columns([5, 1])
+title_col, date_col, download_col = st.columns([5, 1.1, 1.5])
 with title_col:
     st.title("Grinding Machine Performance Monitor")
+pdf_download_slot = download_col.empty()
 with date_col:
     current_time = datetime.now(ZoneInfo("Asia/Kolkata"))
     st.markdown(
@@ -324,3 +571,23 @@ for column, measurement in ((left_chart, "left"), (right_chart, "right")):
 
 with st.expander("Validated measurements"):
     st.dataframe(data[required_columns], width="stretch", hide_index=True)
+
+pdf_bytes = build_pdf_report(
+    data,
+    analysis,
+    statistics,
+    outlier_count,
+    trend_sides,
+    axis_min,
+    axis_max,
+    uploaded_file.name,
+    selected_sheet,
+    current_time,
+)
+pdf_download_slot.download_button(
+    "Download PDF",
+    data=pdf_bytes,
+    file_name=f"axle_process_report_{current_time:%Y%m%d}.pdf",
+    mime="application/pdf",
+    width="stretch",
+)
