@@ -18,6 +18,9 @@ from reportlab.platypus import Flowable, LongTable, Paragraph, SimpleDocTemplate
 
 st.set_page_config(page_title="Axle Process Monitor", page_icon="⚙️", layout="wide")
 
+SPEC_LSL = 130.043
+SPEC_USL = 130.068
+
 st.markdown(
     """
     <style>
@@ -128,26 +131,30 @@ def make_chart(
                 )
             )
 
-    lower_limit = mean - 3 * stddev
-    upper_limit = mean + 3 * stddev
-    for value, label, dash in (
-        (mean, "Mean", "solid"),
-        (upper_limit, "Upper limit (+3σ)", "dash"),
-        (lower_limit, "Lower limit (-3σ)", "dash"),
+    for value, label, color, dash, width in (
+        (mean, "Mean", "#162522", "solid", 2),
+        (mean + stddev, "+1σ", "#78a89a", "dot", 1),
+        (mean - stddev, "-1σ", "#78a89a", "dot", 1),
+        (mean + 2 * stddev, "+2σ", "#d58a20", "dashdot", 1),
+        (mean - 2 * stddev, "-2σ", "#d58a20", "dashdot", 1),
+        (mean + 3 * stddev, "+3σ", "#b84f24", "dash", 1.5),
+        (mean - 3 * stddev, "-3σ", "#b84f24", "dash", 1.5),
+        (SPEC_USL, "USL", "#496da8", "solid", 1.5),
+        (SPEC_LSL, "LSL", "#496da8", "solid", 1.5),
     ):
         figure.add_hline(
             y=value,
-            line_color="#000000",
+            line_color=color,
             line_dash=dash,
-            line_width=1.7,
-            annotation_text=label,
-            annotation_position="top left",
-            annotation_font_color="#000000",
+            line_width=width,
+            annotation_text=f"{label} ({value:.3f})",
+            annotation_position="right",
+            annotation_font_color=color,
         )
 
     figure.update_layout(
         height=390,
-        margin={"l": 12, "r": 18, "t": 26, "b": 10},
+        margin={"l": 12, "r": 110, "t": 26, "b": 10},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#ffffff",
         font={"family": "DM Sans, sans-serif", "color": "#000000", "size": 12},
@@ -222,12 +229,18 @@ class PdfControlChart(Flowable):
         def y_position(value: float) -> float:
             return plot_bottom + (value - self.axis_min) / (self.axis_max - self.axis_min) * plot_height
 
-        for key, color, dash in (
-            ("lower_limit", "#b84f24", [3, 2]),
-            ("mean", "#146b52", []),
-            ("upper_limit", "#b84f24", [3, 2]),
+        for value, color, dash in (
+            (float(self.result["mean"]) - 3 * float(self.result["stddev"]), "#b84f24", [5, 2]),
+            (float(self.result["mean"]) - 2 * float(self.result["stddev"]), "#d58a20", [3, 2]),
+            (float(self.result["mean"]) - float(self.result["stddev"]), "#78a89a", [1, 2]),
+            (float(self.result["mean"]), "#162522", []),
+            (float(self.result["mean"]) + float(self.result["stddev"]), "#78a89a", [1, 2]),
+            (float(self.result["mean"]) + 2 * float(self.result["stddev"]), "#d58a20", [3, 2]),
+            (float(self.result["mean"]) + 3 * float(self.result["stddev"]), "#b84f24", [5, 2]),
+            (SPEC_LSL, "#496da8", [1, 2]),
+            (SPEC_USL, "#496da8", [1, 2]),
         ):
-            y = y_position(float(self.result[key]))
+            y = y_position(value)
             canvas.setStrokeColor(colors.HexColor(color))
             canvas.setDash(dash)
             canvas.setLineWidth(1)
@@ -263,8 +276,10 @@ class PdfControlChart(Flowable):
 
         line_legend_y = self.height - 23
         for legend_x, label, color, dash in (
-            (plot_left, "Mean", "#146b52", []),
-            (plot_left + 70, "3 sigma limits", "#b84f24", [3, 2]),
+            (plot_left, "Mean", "#162522", []),
+            (plot_left + 46, "+/-1 sigma", "#78a89a", [1, 2]),
+            (plot_left + 102, "+/-2 sigma", "#d58a20", [3, 2]),
+            (plot_left + 158, "+/-3 sigma", "#b84f24", [5, 2]),
         ):
             canvas.setStrokeColor(colors.HexColor(color))
             canvas.setDash(dash)
@@ -273,6 +288,14 @@ class PdfControlChart(Flowable):
             canvas.setFillColor(colors.HexColor("#43514d"))
             canvas.setFont("Helvetica", 7)
             canvas.drawString(legend_x + 14, line_legend_y - 2, label)
+
+        canvas.setStrokeColor(colors.HexColor("#496da8"))
+        canvas.setDash([1, 2])
+        canvas.line(plot_left, line_legend_y - 11, plot_left + 10, line_legend_y - 11)
+        canvas.setDash()
+        canvas.setFillColor(colors.HexColor("#43514d"))
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(plot_left + 14, line_legend_y - 13, f"LSL {SPEC_LSL:.3f} / USL {SPEC_USL:.3f}")
 
         outliers = self.result["outliers"]
         trends = self.result["trends"]
@@ -481,6 +504,22 @@ with st.sidebar:
     st.caption("Expected columns: serial number, left, right")
     st.caption("Trend rule: 7 consecutive measurements, all increasing or all decreasing.")
 
+with st.expander("Western Electric SPC rules"):
+    st.markdown(
+        """
+        These are standard signal rules for a control chart, evaluated relative to its centerline and sigma bands:
+
+        1. **One point beyond 3 sigma** on either side of the centerline.
+        2. **Two of three consecutive points beyond 2 sigma** on the same side.
+        3. **Four of five consecutive points beyond 1 sigma** on the same side.
+        4. **Eight consecutive points on one side** of the centerline.
+
+        A signal suggests a possible special cause and should be investigated. USL/LSL are product specification limits, separate from statistical control limits; measurements outside specification require action under the site's quality procedure.
+
+        The automatic alerts on this page currently flag points beyond 3 sigma and a run of 7 strictly increasing or decreasing measurements. The other Western Electric rules above are provided as a reference and are not currently evaluated automatically.
+        """
+    )
+
 if uploaded_file is None:
     st.info("Upload an Excel workbook to view the control charts and process recommendations.")
     st.stop()
@@ -545,6 +584,7 @@ axis_values = pd.concat(
         data["right"],
         pd.Series([result["lower_limit"] for result in analysis.values()]),
         pd.Series([result["upper_limit"] for result in analysis.values()]),
+        pd.Series([SPEC_LSL, SPEC_USL]),
     ]
 )
 axis_min_value = float(axis_values.min())
