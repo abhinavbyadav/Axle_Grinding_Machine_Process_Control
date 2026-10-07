@@ -1,6 +1,8 @@
 # Axle Grinding Process Monitor
 
-Upload an Excel workbook to review left and right axle measurements with three-sigma control charts. The app reports each measurement's mean and sample standard deviation, highlights points beyond the control limits, and flags sustained monotonic trends.
+Upload an Excel workbook to review left and right axle measurements with three-sigma control charts. The app reports each measurement's mean and sample standard deviation, marks measurements outside USL/LSL with red crosses, and flags sustained monotonic trends.
+
+The app also displays separate X-bar and R charts for left and right measurements. Each chart uses subgroups of five consecutive valid rows in upload order. The X-bar charts evaluate all four Western Electric rules; the R charts evaluate ranges against subgroup-size-five control limits. An incomplete trailing subgroup is excluded, and conclusions summarize signals and potential process-stability concerns.
 
 ## Workbook format
 

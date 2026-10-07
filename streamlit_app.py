@@ -20,6 +20,11 @@ st.set_page_config(page_title="Axle Process Monitor", page_icon="⚙️", layout
 
 SPEC_LSL = 130.043
 SPEC_USL = 130.068
+SUBGROUP_SIZE = 5
+XBAR_A2 = 0.577
+R_D3 = 0.0
+R_D4 = 2.114
+SUBGROUP_D2 = 2.326
 
 st.markdown(
     """
@@ -50,7 +55,7 @@ st.markdown(
         padding: 14px 18px; border-radius: 0 5px 5px 0; margin: 0.5rem 0 1.25rem; }
     .status-box.alert { border-left-color: var(--orange); background: #f8ece5; }
     .status-title { font-weight: 700; margin-bottom: 3px; }
-    .status-copy { color: #43514d; }
+    .status-copy { color: #000000; }
     .date-time { color: var(--muted); font: 500 0.82rem 'DM Mono', monospace;
         text-align: right; padding-top: 0.65rem; line-height: 1.5; }
     [data-testid="stDownloadButton"] button {
@@ -79,6 +84,54 @@ def find_trend(values: pd.Series, run_length: int = 7) -> set[int]:
     return trend_positions
 
 
+def find_western_electric_signals(values: pd.Series, center: float, sigma: float) -> dict[str, set[int]]:
+    """Return point positions matching the four Western Electric X-bar rules."""
+    rules = {
+        "Beyond 3 sigma": set(),
+        "2 of 3 beyond 2 sigma": set(),
+        "4 of 5 beyond 1 sigma": set(),
+        "8 on one side": set(),
+    }
+    if not sigma or pd.isna(sigma):
+        return rules
+
+    z_scores = [(float(value) - center) / sigma for value in values]
+    rules["Beyond 3 sigma"].update(
+        index for index, score in enumerate(z_scores) if abs(score) > 3
+    )
+    for start in range(len(z_scores) - 2):
+        window = z_scores[start : start + 3]
+        for side in (1, -1):
+            matches = [index for index, score in enumerate(window) if side * score > 2]
+            if len(matches) >= 2:
+                rules["2 of 3 beyond 2 sigma"].update(start + index for index in matches)
+    for start in range(len(z_scores) - 4):
+        window = z_scores[start : start + 5]
+        for side in (1, -1):
+            matches = [index for index, score in enumerate(window) if side * score > 1]
+            if len(matches) >= 4:
+                rules["4 of 5 beyond 1 sigma"].update(start + index for index in matches)
+    for start in range(len(z_scores) - 7):
+        window = z_scores[start : start + 8]
+        if all(score > 0 for score in window) or all(score < 0 for score in window):
+            rules["8 on one side"].update(range(start, start + 8))
+    return rules
+
+
+def make_subgroups(frame: pd.DataFrame, measurement: str) -> pd.DataFrame:
+    """Summarize consecutive full groups for one measurement side."""
+    subgroup_rows = []
+    for start in range(0, len(frame) - SUBGROUP_SIZE + 1, SUBGROUP_SIZE):
+        subgroup = frame.iloc[start : start + SUBGROUP_SIZE]
+        values = subgroup[measurement]
+        subgroup_rows.append({
+            "_subgroup_label": f"{subgroup['_serial_label'].iloc[0]} - {subgroup['_serial_label'].iloc[-1]}",
+            "_xbar": float(values.mean()),
+            "_range": float(values.max() - values.min()),
+        })
+    return pd.DataFrame(subgroup_rows, columns=["_subgroup_label", "_xbar", "_range"])
+
+
 def make_chart(
     frame: pd.DataFrame,
     measurement: str,
@@ -92,13 +145,15 @@ def make_chart(
 ) -> go.Figure:
     values = frame[measurement]
     x_values = frame["_serial_label"]
-    outlier_mask = [position in outlier_positions for position in range(len(frame))]
+    spec_positions = set(frame.index[(values < SPEC_LSL) | (values > SPEC_USL)])
+    outlier_mask = [position in outlier_positions and position not in spec_positions for position in range(len(frame))]
+    spec_mask = [position in spec_positions for position in range(len(frame))]
     trend_mask = [
-        position in trend_positions and position not in outlier_positions
+        position in trend_positions and position not in outlier_positions and position not in spec_positions
         for position in range(len(frame))
     ]
     regular_mask = [
-        position not in outlier_positions and position not in trend_positions
+        position not in outlier_positions and position not in trend_positions and position not in spec_positions
         for position in range(len(frame))
     ]
     figure = go.Figure()
@@ -113,9 +168,10 @@ def make_chart(
         )
     )
     for mask, name, color, symbol, size in (
-        (regular_mask, "In control", "#146b52", "circle", 8),
+        (regular_mask, "Within limits", "#146b52", "circle", 8),
         (trend_mask, "Trend", "#d58a20", "diamond", 10),
         (outlier_mask, "Beyond 3σ", "#b84f24", "x", 12),
+        (spec_mask, "Outside specification", "#c62828", "x", 13),
     ):
         indices = [position for position, include in enumerate(mask) if include]
         if indices:
@@ -149,7 +205,7 @@ def make_chart(
             line_width=width,
             annotation_text=f"{label} ({value:.3f})",
             annotation_position="right",
-            annotation_font_color=color,
+            annotation_font_color="#000000",
         )
 
     figure.update_layout(
@@ -187,6 +243,105 @@ def make_chart(
             "zerolinewidth": 1,
             "range": [axis_min, axis_max],
             "dtick": axis_dtick,
+        },
+        hovermode="closest",
+    )
+    return figure
+
+
+def make_subgroup_chart(
+    frame: pd.DataFrame,
+    value_column: str,
+    title: str,
+    center: float,
+    lower_limit: float,
+    upper_limit: float,
+    signal_positions: set[int],
+    sigma: float | None = None,
+) -> go.Figure:
+    values = frame[value_column]
+    x_values = frame["_subgroup_label"]
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(
+        x=x_values,
+        y=values,
+        mode="lines",
+        line={"color": "#b9c7c0", "width": 1.5},
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    regular_positions = [position for position in range(len(frame)) if position not in signal_positions]
+    if regular_positions:
+        figure.add_trace(go.Scatter(
+            x=x_values.iloc[regular_positions],
+            y=values.iloc[regular_positions],
+            mode="markers",
+            name="No signal",
+            marker={"color": "#146b52", "symbol": "circle", "size": 8},
+            customdata=x_values.iloc[regular_positions],
+            hovertemplate="Serial: %{customdata}<br>" + title + ": %{y:.5f}<extra></extra>",
+        ))
+    if signal_positions:
+        positions = sorted(signal_positions)
+        figure.add_trace(go.Scatter(
+            x=x_values.iloc[positions],
+            y=values.iloc[positions],
+            mode="markers",
+            name="Western Electric signal" if sigma is not None else "Outside control limits",
+            marker={"color": "#c62828", "symbol": "x", "size": 12, "line": {"width": 2}},
+            customdata=x_values.iloc[positions],
+            hovertemplate="Serial: %{customdata}<br>" + title + ": %{y:.5f}<extra></extra>",
+        ))
+
+    lines = [
+        (center, "Center line", "#162522", "solid", 2),
+        (upper_limit, "UCL", "#b84f24", "dash", 1.5),
+        (lower_limit, "LCL", "#b84f24", "dash", 1.5),
+    ]
+    if sigma is not None and sigma > 0:
+        lines.extend([
+            (center + sigma, "+1σ", "#78a89a", "dot", 1),
+            (center - sigma, "-1σ", "#78a89a", "dot", 1),
+            (center + 2 * sigma, "+2σ", "#d58a20", "dashdot", 1),
+            (center - 2 * sigma, "-2σ", "#d58a20", "dashdot", 1),
+        ])
+    for value, label, color, dash, width in lines:
+        figure.add_hline(
+            y=value,
+            line_color=color,
+            line_dash=dash,
+            line_width=width,
+            annotation_text=f"{label} ({value:.5f})",
+            annotation_position="right",
+            annotation_font_color="#000000",
+        )
+
+    axis_values = [float(values.min()), float(values.max()), lower_limit, upper_limit]
+    axis_min = min(axis_values)
+    axis_max = max(axis_values)
+    padding = (axis_max - axis_min) * 0.08 if axis_max > axis_min else max(abs(axis_max) * 0.05, 0.1)
+    figure.update_layout(
+        height=350,
+        margin={"l": 12, "r": 110, "t": 26, "b": 10},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#ffffff",
+        font={"family": "DM Sans, sans-serif", "color": "#000000", "size": 12},
+        legend={"orientation": "h", "y": 1.08, "x": 0, "font": {"color": "#000000"}},
+        xaxis={
+            "title": {"text": "Serial number (upload order)", "font": {"color": "#000000"}},
+            "type": "category",
+            "showgrid": False,
+            "tickfont": {"color": "#000000"},
+        },
+        yaxis={
+            "title": {"text": title, "font": {"color": "#000000"}},
+            "showline": True,
+            "linecolor": "#000000",
+            "ticks": "outside",
+            "tickcolor": "#000000",
+            "tickfont": {"color": "#000000"},
+            "gridcolor": "#dce3dc",
+            "range": [axis_min - padding, axis_max + padding],
         },
         hovermode="closest",
     )
@@ -516,7 +671,7 @@ with st.expander("Western Electric SPC rules"):
 
         A signal suggests a possible special cause and should be investigated. USL/LSL are product specification limits, separate from statistical control limits; measurements outside specification require action under the site's quality procedure.
 
-        The automatic alerts on this page currently flag points beyond 3 sigma and a run of 7 strictly increasing or decreasing measurements. The other Western Electric rules above are provided as a reference and are not currently evaluated automatically.
+        The left and right measurements are analyzed separately in subgroups of five consecutive valid rows. The X-bar chart evaluates all four Western Electric rules, and the R chart checks ranges against the subgroup-size-five control limits. An incomplete trailing group is excluded from these charts; the individual measurement charts retain their 3 sigma and seven-point trend alerts.
         """
     )
 
@@ -576,6 +731,42 @@ for measurement, summary in statistics.items():
         "trends": trends,
     }
 
+subgroup_frames = {measurement: make_subgroups(data, measurement) for measurement in ("left", "right")}
+subgroup_analysis: dict[str, dict[str, object]] = {}
+for measurement, subgroup_frame in subgroup_frames.items():
+    if len(subgroup_frame) < 2:
+        continue
+    xbar_center = float(subgroup_frame["_xbar"].mean())
+    range_center = float(subgroup_frame["_range"].mean())
+    xbar_sigma = range_center / (SUBGROUP_D2 * (SUBGROUP_SIZE ** 0.5))
+    xbar_lower = xbar_center - XBAR_A2 * range_center
+    xbar_upper = xbar_center + XBAR_A2 * range_center
+    range_lower = R_D3 * range_center
+    range_upper = R_D4 * range_center
+    xbar_rule_signals = find_western_electric_signals(subgroup_frame["_xbar"], xbar_center, xbar_sigma)
+    xbar_signal_positions = set().union(*xbar_rule_signals.values())
+    range_signal_positions = set(
+        subgroup_frame.index[
+            (subgroup_frame["_range"] < range_lower) | (subgroup_frame["_range"] > range_upper)
+        ]
+    )
+    subgroup_analysis[measurement] = {
+        "xbar_center": xbar_center,
+        "xbar_sigma": xbar_sigma,
+        "xbar_lower": xbar_lower,
+        "xbar_upper": xbar_upper,
+        "xbar_rule_signals": xbar_rule_signals,
+        "xbar_signal_positions": xbar_signal_positions,
+        "range_center": range_center,
+        "range_lower": range_lower,
+        "range_upper": range_upper,
+        "range_signal_positions": range_signal_positions,
+    }
+out_of_spec_count = int(
+    ((data["left"] < SPEC_LSL) | (data["left"] > SPEC_USL)).sum()
+    + ((data["right"] < SPEC_LSL) | (data["right"] > SPEC_USL)).sum()
+)
+
 outlier_count = sum(len(result["outliers"]) for result in analysis.values())
 trend_sides = [name for name, result in analysis.items() if result["trends"]]
 axis_values = pd.concat(
@@ -601,7 +792,13 @@ left_col.metric("Left mean", f"{statistics['left']['mean']:.3f}")
 right_col.metric("Right mean", f"{statistics['right']['mean']:.3f}")
 sample_col.metric("Valid measurements", f"{len(data):,}")
 
-if outlier_count:
+if out_of_spec_count:
+    st.markdown(
+        f'<div class="status-box alert"><div class="status-title">Specification failure · {out_of_spec_count} point(s) outside USL/LSL</div>'
+        '<div class="status-copy">Review the red-cross measurements and follow the site quality procedure for nonconforming product.</div></div>',
+        unsafe_allow_html=True,
+    )
+elif outlier_count:
     st.markdown(
         f'<div class="status-box alert"><div class="status-title">STOP MACHINE · {outlier_count} point(s) beyond 3σ</div>'
         '<div class="status-copy">Stop the machine and hand over to maintenance for inspection before resuming production.</div></div>',
@@ -650,6 +847,109 @@ for column, measurement in ((left_chart, "left"), (right_chart, "right")):
             st.warning("A run of 7 consecutive increases or decreases was detected. Check for process drift and monitor closely.")
         else:
             st.caption("No outliers or sustained trend detected for this measurement.")
+
+st.subheader("X-bar and R charts")
+st.caption("Left and right are analyzed independently in groups of five consecutive valid rows in upload order.")
+incomplete_count = len(data) % SUBGROUP_SIZE
+if len(data) < 2 * SUBGROUP_SIZE:
+    st.warning("At least 10 valid measurements are needed on each side to form two complete subgroups of five and estimate control limits.")
+else:
+    if incomplete_count:
+        st.info(f"The final {incomplete_count} valid row(s) are excluded from X-bar/R charts because they do not complete a subgroup of five.")
+    for measurement in ("left", "right"):
+        subgroup_frame = subgroup_frames[measurement]
+        result = subgroup_analysis[measurement]
+        st.subheader(f"{measurement.title()} X-bar and R charts")
+        xbar_col, range_col = st.columns(2, gap="large")
+        with xbar_col:
+            st.subheader("X-bar chart")
+            st.plotly_chart(
+                make_subgroup_chart(
+                    subgroup_frame,
+                    "_xbar",
+                    "Subgroup mean",
+                    result["xbar_center"],
+                    result["xbar_lower"],
+                    result["xbar_upper"],
+                    result["xbar_signal_positions"],
+                    result["xbar_sigma"],
+                ),
+                width="stretch",
+            )
+        with range_col:
+            st.subheader("R chart")
+            st.plotly_chart(
+                make_subgroup_chart(
+                    subgroup_frame,
+                    "_range",
+                    "Subgroup range",
+                    result["range_center"],
+                    result["range_lower"],
+                    result["range_upper"],
+                    result["range_signal_positions"],
+                ),
+                width="stretch",
+            )
+
+        st.markdown(f"**{measurement.title()} interpretation**")
+        if result["range_center"] == 0:
+            st.warning(
+                f"{measurement.title()} X-bar: all subgroup ranges are zero, so estimated variation and the control zones are degenerate. Verify the measurements and measurement system before interpreting stability."
+            )
+        elif result["xbar_signal_positions"]:
+            detected_rules = [name for name, positions in result["xbar_rule_signals"].items() if positions]
+            st.warning(
+                f"{measurement.title()} X-bar: Western Electric signal(s) detected ("
+                + "; ".join(detected_rules)
+                + "). The process average may have shifted or developed a non-random pattern; investigate assignable causes before making adjustments."
+            )
+        else:
+            st.success(f"{measurement.title()} X-bar: no Western Electric signals detected; subgroup averages show no flagged shift or non-random pattern.")
+
+        if result["range_signal_positions"]:
+            labels = ", ".join(
+                subgroup_frame.loc[sorted(result["range_signal_positions"]), "_subgroup_label"].tolist()
+            )
+            st.warning(
+                f"{measurement.title()} R: subgroup range(s) for {labels} fall outside the control limits. Within-subgroup variability may have changed; check measurement consistency, tooling, and process conditions."
+            )
+        else:
+            st.success(f"{measurement.title()} R: all subgroup ranges are within control limits; within-subgroup variability appears stable.")
+
+st.subheader("X-bar/R parameters and formulas")
+parameter_col, formula_col = st.columns([1, 2], gap="large")
+with parameter_col:
+    parameter_table = pd.DataFrame({
+        "Parameter": ["Subgroup size (n)", "Complete subgroups (m)", "A2", "D3", "D4", "d2"],
+        "Value": [
+            str(SUBGROUP_SIZE),
+            str(len(subgroup_frames["left"])),
+            f"{XBAR_A2:.3f}",
+            f"{R_D3:.3f}",
+            f"{R_D4:.3f}",
+            f"{SUBGROUP_D2:.3f}",
+        ],
+    })
+    parameter_style = parameter_table.style.set_properties(**{"color": "#000000"})
+    parameter_style = parameter_style.set_table_styles([
+        {
+            "selector": "th",
+            "props": [
+                ("color", "#000000"),
+                ("font-weight", "bold"),
+                ("background-color", "#e8f1ec"),
+            ],
+        },
+    ])
+    st.table(parameter_style)
+with formula_col:
+    st.markdown("**X-bar chart limits**")
+    st.latex(r"\bar{\bar{X}} = \frac{1}{m}\sum_{i=1}^{m}\bar{X}_i, \qquad \bar{R} = \frac{1}{m}\sum_{i=1}^{m}R_i")
+    st.latex(r"\mathrm{UCL}_{\bar{X}} = \bar{\bar{X}} + A_2\bar{R}, \qquad \mathrm{CL}_{\bar{X}} = \bar{\bar{X}}, \qquad \mathrm{LCL}_{\bar{X}} = \bar{\bar{X}} - A_2\bar{R}")
+    st.markdown("**R chart limits**")
+    st.latex(r"\mathrm{UCL}_{R} = D_4\bar{R}, \qquad \mathrm{CL}_{R} = \bar{R}, \qquad \mathrm{LCL}_{R} = D_3\bar{R}")
+    st.markdown("**Western Electric zone sigma estimate for the X-bar chart**")
+    st.latex(r"\hat{\sigma}_{\bar{X}} = \frac{\bar{R}}{d_2\sqrt{n}}")
 
 with st.expander("Validated measurements"):
     st.dataframe(data[required_columns], width="stretch", hide_index=True)
