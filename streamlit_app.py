@@ -480,10 +480,132 @@ class PdfControlChart(Flowable):
         canvas.restoreState()
 
 
+class PdfSubgroupChart(Flowable):
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        value_column: str,
+        title: str,
+        center: float,
+        lower_limit: float,
+        upper_limit: float,
+        signal_positions: set[int],
+        sigma: float | None = None,
+    ):
+        super().__init__()
+        self.frame = frame
+        self.value_column = value_column
+        self.title = title
+        self.center = center
+        self.lower_limit = lower_limit
+        self.upper_limit = upper_limit
+        self.signal_positions = signal_positions
+        self.sigma = sigma
+        self.height = 2.0 * inch
+
+    def wrap(self, avail_width: float, avail_height: float) -> tuple[float, float]:
+        self.width = avail_width
+        return self.width, self.height
+
+    def draw(self) -> None:
+        canvas = self.canv
+        values = [float(value) for value in self.frame[self.value_column]]
+        observed_min = min(values + [self.lower_limit, self.center])
+        observed_max = max(values + [self.upper_limit, self.center])
+        padding = (observed_max - observed_min) * 0.08
+        if padding == 0:
+            padding = max(abs(observed_max) * 0.001, 0.001)
+        axis_min = observed_min - padding
+        axis_max = observed_max + padding
+        plot_left, plot_bottom = 31, 25
+        plot_right, plot_top = self.width - 39, self.height - 18
+        plot_width = plot_right - plot_left
+        plot_height = plot_top - plot_bottom
+
+        def y_position(value: float) -> float:
+            return plot_bottom + (value - axis_min) / (axis_max - axis_min) * plot_height
+
+        canvas.saveState()
+        canvas.setFillColor(colors.white)
+        canvas.rect(plot_left, plot_bottom, plot_width, plot_height, fill=1, stroke=0)
+
+        for tick in range(3):
+            value = axis_min + (axis_max - axis_min) * tick / 2
+            y = y_position(value)
+            canvas.setStrokeColor(colors.HexColor("#dce3dc"))
+            canvas.setLineWidth(0.45)
+            canvas.line(plot_left, y, plot_right, y)
+            canvas.setFillColor(colors.HexColor("#43514d"))
+            canvas.setFont("Helvetica", 6)
+            canvas.drawRightString(plot_left - 4, y - 2, f"{value:.4f}")
+
+        control_lines = [
+            (self.upper_limit, "UCL", "#b84f24", [4, 2]),
+            (self.center, "CL", "#162522", []),
+            (self.lower_limit, "LCL", "#b84f24", [4, 2]),
+        ]
+        if self.sigma is not None and self.sigma > 0:
+            control_lines.extend([
+                (self.center + self.sigma, "+1 sigma", "#78a89a", [1, 2]),
+                (self.center - self.sigma, "-1 sigma", "#78a89a", [1, 2]),
+                (self.center + 2 * self.sigma, "+2 sigma", "#d58a20", [3, 2]),
+                (self.center - 2 * self.sigma, "-2 sigma", "#d58a20", [3, 2]),
+            ])
+        for value, _, color, dash in control_lines:
+            y = y_position(value)
+            canvas.setStrokeColor(colors.HexColor(color))
+            canvas.setDash(dash)
+            canvas.setLineWidth(0.8)
+            canvas.line(plot_left, y, plot_right, y)
+        canvas.setDash()
+
+        positions = [
+            (
+                plot_left + plot_width * index / max(len(values) - 1, 1),
+                y_position(value),
+            )
+            for index, value in enumerate(values)
+        ]
+        canvas.setStrokeColor(colors.HexColor("#aab9b2"))
+        canvas.setLineWidth(0.8)
+        for start, end in zip(positions, positions[1:]):
+            canvas.line(start[0], start[1], end[0], end[1])
+
+        for index, (x, y) in enumerate(positions):
+            if index in self.signal_positions:
+                canvas.setStrokeColor(colors.HexColor("#c62828"))
+                canvas.setLineWidth(1.4)
+                canvas.line(x - 3, y - 3, x + 3, y + 3)
+                canvas.line(x - 3, y + 3, x + 3, y - 3)
+            else:
+                canvas.setFillColor(colors.HexColor("#146b52"))
+                canvas.circle(x, y, 2.3, fill=1, stroke=0)
+
+        canvas.setFillColor(colors.HexColor("#43514d"))
+        canvas.setFont("Helvetica", 6)
+        for index in sorted({0, len(values) // 2, len(values) - 1}):
+            x = positions[index][0]
+            label = str(self.frame["_subgroup_label"].iloc[index])[:16]
+            canvas.drawCentredString(x, plot_bottom - 9, label)
+
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.setFillColor(colors.HexColor("#162522"))
+        canvas.drawString(plot_left, self.height - 10, self.title)
+        canvas.setFont("Helvetica", 6)
+        for value, label, color, _ in control_lines[:3]:
+            canvas.setFillColor(colors.HexColor(color))
+            canvas.drawString(plot_right + 3, y_position(value) - 2, label)
+        canvas.setFillColor(colors.HexColor("#43514d"))
+        canvas.drawCentredString(plot_left + plot_width / 2, 4, "Subgroup (upload order)")
+        canvas.restoreState()
+
+
 def build_pdf_report(
     frame: pd.DataFrame,
     analysis: dict[str, dict[str, object]],
     statistics: dict[str, dict[str, float]],
+    subgroup_frames: dict[str, pd.DataFrame],
+    subgroup_analysis: dict[str, dict[str, object]],
     outlier_count: int,
     trend_sides: list[str],
     axis_min: float,
@@ -606,6 +728,176 @@ def build_pdf_report(
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     story.extend([Paragraph("Control charts", styles["Section"]), chart_table])
+
+    story.extend([
+        Paragraph("X-bar and R control charts", styles["Section"]),
+        Paragraph(
+            f"Each subgroup contains {SUBGROUP_SIZE} consecutive valid measurements in upload order. "
+            f"There are {len(subgroup_frames['left'])} complete subgroups; "
+            f"{len(frame) % SUBGROUP_SIZE} trailing measurement(s) are excluded.",
+            styles["Small"],
+        ),
+    ])
+    if len(subgroup_frames["left"]) < 2:
+        story.append(Paragraph(
+            "At least two complete subgroups are required to estimate control limits. "
+            "The X-bar/R plots and calculated limits are therefore unavailable for this upload.",
+            styles["Small"],
+        ))
+    else:
+        for measurement in ("left", "right"):
+            subgroup_frame = subgroup_frames[measurement]
+            result = subgroup_analysis[measurement]
+            story.append(Paragraph(f"{measurement.title()} measurement", styles["Heading3"]))
+            xbar_chart = PdfSubgroupChart(
+                subgroup_frame,
+                "_xbar",
+                "X-bar chart",
+                float(result["xbar_center"]),
+                float(result["xbar_lower"]),
+                float(result["xbar_upper"]),
+                result["xbar_signal_positions"],
+                float(result["xbar_sigma"]),
+            )
+            range_chart = PdfSubgroupChart(
+                subgroup_frame,
+                "_range",
+                "R chart",
+                float(result["range_center"]),
+                float(result["range_lower"]),
+                float(result["range_upper"]),
+                result["range_signal_positions"],
+            )
+            subgroup_chart_table = Table(
+                [[xbar_chart, range_chart]],
+                colWidths=[3.6 * inch, 3.6 * inch],
+            )
+            subgroup_chart_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LINEBEFORE", (1, 0), (1, -1), 0.5, colors.HexColor("#dce3dc")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+            story.append(subgroup_chart_table)
+
+            if result["range_center"] == 0:
+                xbar_finding = (
+                    "All subgroup ranges are zero; variation and X-bar sigma zones are degenerate. "
+                    "Verify the measurements and measurement system before interpreting stability."
+                )
+            elif result["xbar_signal_positions"]:
+                detected_rules = [
+                    name for name, positions in result["xbar_rule_signals"].items() if positions
+                ]
+                xbar_finding = "Western Electric signal(s): " + "; ".join(detected_rules) + "."
+            else:
+                xbar_finding = "No Western Electric X-bar signals detected."
+            if result["range_signal_positions"]:
+                range_labels = ", ".join(
+                    subgroup_frame.loc[
+                        sorted(result["range_signal_positions"]), "_subgroup_label"
+                    ].tolist()
+                )
+                range_finding = f"R-chart signal(s) outside limits: {range_labels}."
+            else:
+                range_finding = "All subgroup ranges are within R-chart limits."
+            story.append(Paragraph(
+                escape(f"{xbar_finding} {range_finding}"),
+                styles["Small"],
+            ))
+
+        parameter_rows = [
+            ["Calculated limit / estimate", "Left", "Right"],
+            ["X-bar center line", *[
+                f"{float(subgroup_analysis[side]['xbar_center']):.5f}"
+                for side in ("left", "right")
+            ]],
+            ["X-bar LCL / UCL", *[
+                f"{float(subgroup_analysis[side]['xbar_lower']):.5f} / "
+                f"{float(subgroup_analysis[side]['xbar_upper']):.5f}"
+                for side in ("left", "right")
+            ]],
+            ["X-bar sigma estimate", *[
+                f"{float(subgroup_analysis[side]['xbar_sigma']):.5f}"
+                for side in ("left", "right")
+            ]],
+            ["R center line", *[
+                f"{float(subgroup_analysis[side]['range_center']):.5f}"
+                for side in ("left", "right")
+            ]],
+            ["R LCL / UCL", *[
+                f"{float(subgroup_analysis[side]['range_lower']):.5f} / "
+                f"{float(subgroup_analysis[side]['range_upper']):.5f}"
+                for side in ("left", "right")
+            ]],
+        ]
+        parameter_table = Table(
+            parameter_rows,
+            colWidths=[2.55 * inch, 2.32 * inch, 2.32 * inch],
+        )
+        parameter_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8f1ec")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce3dc")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.extend([Spacer(1, 5), parameter_table])
+
+    story.extend([
+        Paragraph("Parameters and equations", styles["Heading3"]),
+        Paragraph(
+            f"n = {SUBGROUP_SIZE} measurements per subgroup; "
+            f"m = {len(subgroup_frames['left'])} complete subgroups; "
+            f"A2 = {XBAR_A2:.3f}, D3 = {R_D3:.3f}, D4 = {R_D4:.3f}, "
+            f"d2 = {SUBGROUP_D2:.3f}.",
+            styles["Small"],
+        ),
+        Paragraph(
+            "For subgroup i: Xbar_i = sum(X_ij) / n; R_i = max(X_ij) - min(X_ij). "
+            "Xbarbar = sum(Xbar_i) / m; Rbar = sum(R_i) / m.",
+            styles["Small"],
+        ),
+        Paragraph(
+            "X-bar chart: UCL = Xbarbar + A2*Rbar; CL = Xbarbar; "
+            "LCL = Xbarbar - A2*Rbar.",
+            styles["Small"],
+        ),
+        Paragraph(
+            "R chart: UCL = D4*Rbar; CL = Rbar; LCL = D3*Rbar. "
+            "Estimated X-bar standard deviation: sigma_hat = Rbar / (d2*sqrt(n)).",
+            styles["Small"],
+        ),
+        Paragraph("Western Electric primer: reading and interpreting the charts", styles["Heading3"]),
+        Paragraph(
+            "Read each chart from left to right in upload order. The X-bar chart plots subgroup "
+            "averages and tracks process location; the R chart plots within-subgroup ranges and "
+            "tracks short-term variation. The center line is the process average (X-bar) or average "
+            "range (R); UCL and LCL are statistical control limits, not product specification limits.",
+            styles["Small"],
+        ),
+        Paragraph(
+            "On the X-bar chart, investigate any of these Western Electric signals: (1) one point "
+            "more than 3 sigma from the center line; (2) at least 2 of 3 consecutive points more "
+            "than 2 sigma from the center line on the same side; (3) at least 4 of 5 consecutive "
+            "points more than 1 sigma from the center line on the same side; or (4) 8 consecutive "
+            "points on the same side of the center line. Sigma zones use sigma_hat shown above.",
+            styles["Small"],
+        ),
+        Paragraph(
+            "On the R chart, a point outside its control limits signals a possible change in "
+            "within-subgroup variation; Western Electric zone rules are not applied to this chart. "
+            "A signal is evidence to investigate a possible special cause, not proof of its cause. "
+            "Check measurement consistency, tooling, setup, and process conditions before adjustment. "
+            "A stable chart does not by itself establish process capability or conformance to USL/LSL; "
+            "handle measurements outside specification under the site's quality procedure.",
+            styles["Small"],
+        ),
+    ])
 
     story.extend([Paragraph("Validated measurements", styles["Section"])])
     table_data = [["Serial number", "Left", "Right"]]
@@ -958,6 +1250,8 @@ pdf_bytes = build_pdf_report(
     data,
     analysis,
     statistics,
+    subgroup_frames,
+    subgroup_analysis,
     outlier_count,
     trend_sides,
     axis_min,
